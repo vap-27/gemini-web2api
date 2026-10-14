@@ -43,43 +43,80 @@ func (c *Client) CookieRefreshLoop(ctx context.Context, interval time.Duration) 
 	}
 }
 
-// RotateCookie fetches a fresh __Secure-1PSIDTS and applies it. A file-backed
-// cookie is rewritten in place (so it survives restarts); an inline cookie is
-// rotated in memory only (it survives the process run but not a restart).
+// RotateCookie fetches a fresh __Secure-1PSIDTS and applies it. It rotates all
+// sessions in the session pool. A file-backed cookie is rewritten in place
+// (so it survives restarts); an inline cookie is rotated in memory only.
 func (c *Client) RotateCookie(ctx context.Context) {
-	cookie, sapisid := c.loadCookie()
-	if cookie == "" || cookieValue(cookie, cookiePSIDTS) == "" {
-		return
-	}
-	newTS, err := c.fetchRotatedTS(ctx, cookie)
-	if err != nil {
-		c.log.Warn("cookie rotation request failed", "err", err)
-		return
-	}
-	if newTS == "" {
-		return // Google issued no new token this cycle
-	}
-	newCookie := replaceCookieValue(cookie, cookiePSIDTS, newTS)
+	c.sessMu.Lock()
+	sessions := append([]*Session(nil), c.sessions...)
+	c.sessMu.Unlock()
 
-	// Persist to disk only for a file-backed cookie; an inline cookie has no file.
-	if c.cfg.Cookie == "" && c.cfg.CookieFile != "" {
-		if err := os.WriteFile(c.cfg.CookieFile, []byte(newCookie), 0o600); err != nil {
-			c.log.Warn("cookie rotation persist failed", "err", err)
-			return
+	rotatedCount := 0
+	for _, sess := range sessions {
+		sess.mu.Lock()
+		cookie := sess.CookieStr
+		sess.mu.Unlock()
+		if cookie == "" {
+			cookie, _ = c.loadCookie()
+		}
+		if cookie == "" || cookieValue(cookie, cookiePSIDTS) == "" {
+			continue
+		}
+		newTS, err := c.fetchRotatedTS(ctx, cookie)
+		if err != nil {
+			c.log.Warn("cookie rotation request failed", "err", err, "session", sess.ID)
+			continue
+		}
+		if newTS == "" {
+			continue
+		}
+		newCookie := replaceCookieValue(cookie, cookiePSIDTS, newTS)
+		sess.mu.Lock()
+		sess.CookieStr = newCookie
+		sess.SAPISID = cookieValue(newCookie, cookieSAPISID)
+		sess.mu.Unlock()
+
+		rotatedCount++
+	}
+
+	// Persist to disk if sessions are file-backed
+	if c.cfg.CookieFile != "" && rotatedCount > 0 {
+		var lines []string
+		allFileBacked := true
+		for _, s := range sessions {
+			if !s.FileBacked || s.FilePath != c.cfg.CookieFile {
+				allFileBacked = false
+				break
+			}
+			s.mu.Lock()
+			lines = append(lines, s.CookieStr)
+			s.mu.Unlock()
+		}
+		if allFileBacked && len(lines) > 0 {
+			if err := os.WriteFile(c.cfg.CookieFile, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+				c.log.Warn("cookie rotation persist failed", "err", err)
+			}
 		}
 	}
 
-	c.cookieMu.Lock()
-	c.cookieStr, c.cookieSAPI, c.cookieLoaded = newCookie, sapisid, true
-	if c.cfg.CookieFile != "" {
-		if info, err := os.Stat(c.cfg.CookieFile); err == nil {
-			c.cookieMtime = info.ModTime()
+	// Update legacy fields for backwards compatibility
+	if len(sessions) > 0 {
+		sessions[0].mu.Lock()
+		c0, s0 := sessions[0].CookieStr, sessions[0].SAPISID
+		sessions[0].mu.Unlock()
+		c.cookieMu.Lock()
+		c.cookieStr, c.cookieSAPI, c.cookieLoaded = c0, s0, true
+		if c.cfg.CookieFile != "" {
+			if info, err := os.Stat(c.cfg.CookieFile); err == nil {
+				c.cookieMtime = info.ModTime()
+			}
 		}
+		c.cookieMu.Unlock()
 	}
-	c.cookieMu.Unlock()
-	c.log.Info("rotated __Secure-1PSIDTS cookie")
-	// Keep the XSRF "at" token in sync with the rotated session. The model list is
-	// refreshed by the caller (startup, then the periodic refresh loop).
+
+	if rotatedCount > 0 {
+		c.log.Info("rotated __Secure-1PSIDTS cookie", "count", rotatedCount)
+	}
 	c.refreshAtToken(ctx)
 }
 

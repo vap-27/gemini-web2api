@@ -450,3 +450,80 @@ func TestNewClampsNumericDefaults(t *testing.T) {
 			c.cfg.RequestTimeout, c.cfg.RetryAttempts, c.cfg.RetryDelaySec)
 	}
 }
+
+func TestConcurrencyLimiter(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConcurrency = 2
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.MaxConcurrency() != 2 {
+		t.Errorf("MaxConcurrency = %d, want 2", c.MaxConcurrency())
+	}
+	if c.ActiveRequests() != 0 {
+		t.Errorf("ActiveRequests = %d, want 0", c.ActiveRequests())
+	}
+
+	rel1, err := c.acquireConcurrency(context.Background())
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	if c.ActiveRequests() != 1 {
+		t.Errorf("ActiveRequests = %d, want 1", c.ActiveRequests())
+	}
+
+	rel2, err := c.acquireConcurrency(context.Background())
+	if err != nil {
+		t.Fatalf("acquire 2: %v", err)
+	}
+	if c.ActiveRequests() != 2 {
+		t.Errorf("ActiveRequests = %d, want 2", c.ActiveRequests())
+	}
+
+	// 3rd acquire with timeout should fail because limit is 2
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = c.acquireConcurrency(ctx)
+	if err == nil {
+		t.Errorf("expected acquire to fail when limit is reached")
+	}
+
+	rel1()
+	if c.ActiveRequests() != 1 {
+		t.Errorf("ActiveRequests after rel1 = %d, want 1", c.ActiveRequests())
+	}
+	rel2()
+	if c.ActiveRequests() != 0 {
+		t.Errorf("ActiveRequests after rel2 = %d, want 0", c.ActiveRequests())
+	}
+}
+
+func TestMultiSessionPool(t *testing.T) {
+	cfg := testConfig()
+	cfg.Cookies = []string{
+		"__Secure-1PSID=user1; SAPISID=sapi1",
+		"__Secure-1PSID=user2; SAPISID=sapi2",
+	}
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.SessionCount() != 2 {
+		t.Fatalf("SessionCount = %d, want 2", c.SessionCount())
+	}
+
+	s1 := c.nextSession()
+	s2 := c.nextSession()
+	s3 := c.nextSession()
+
+	if s1.CookieStr != cfg.Cookies[0] && s1.CookieStr != cfg.Cookies[1] {
+		t.Errorf("unexpected s1 cookie: %q", s1.CookieStr)
+	}
+	if s2.CookieStr == s1.CookieStr {
+		t.Errorf("expected s2 to rotate to a different session, got same: %q", s2.CookieStr)
+	}
+	if s3.CookieStr != s1.CookieStr {
+		t.Errorf("expected round-robin s3 to equal s1, got: %q", s3.CookieStr)
+	}
+}

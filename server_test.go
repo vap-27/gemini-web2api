@@ -245,3 +245,77 @@ func TestMessagesAuthGate(t *testing.T) {
 		t.Errorf("status = %d, want 401", rr.Code)
 	}
 }
+
+func TestHandleModelOpenAISingle(t *testing.T) {
+	s := newTestServer(t, testConfig())
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/gemini-3.5-flash", nil)
+	s.handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		ID     string `json:"id"`
+		Object string `json:"object"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.ID != "gemini-3.5-flash" || resp.Object != "model" {
+		t.Errorf("got id=%q, object=%q", resp.ID, resp.Object)
+	}
+}
+
+func TestHandleModelGoogleSingle(t *testing.T) {
+	s := newTestServer(t, testConfig())
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1beta/models/gemini-3.1-pro", nil)
+	s.handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Name != "models/gemini-3.1-pro" {
+		t.Errorf("got name=%q, want models/gemini-3.1-pro", resp.Name)
+	}
+}
+
+func TestHandleModelOpenAINotFound(t *testing.T) {
+	s := newTestServer(t, testConfig())
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/non-existent-model", nil)
+	s.handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestHealthConcurrencyFields(t *testing.T) {
+	cfg := testConfig()
+	cfg.Gemini.MaxConcurrency = 15
+	s := newTestServer(t, cfg)
+
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("status = %v", resp["status"])
+	}
+	if maxC, ok := resp["max_concurrency"].(float64); !ok || int(maxC) != 15 {
+		t.Errorf("max_concurrency = %v, want 15", resp["max_concurrency"])
+	}
+}

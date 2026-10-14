@@ -9,7 +9,7 @@ import (
 	"github.com/n0madic/go-gemini-web2api/pkg/gemini"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // defaultListen is the default bind address (localhost only) used when GEMINI_LISTEN
 // is unset.
@@ -20,11 +20,12 @@ const defaultListen = "127.0.0.1:8081"
 // The upstream Gemini settings live in the embedded gemini.Config; the rest are
 // the proxy's own network/CLI concerns.
 type Config struct {
-	Listen        string   // bind address, e.g. 127.0.0.1:8081 or :8081
-	LogRequests   bool     // log each request at Info level
-	CookieRefresh int      // minutes between __Secure-1PSIDTS rotations (0 = off)
-	APIKeys       []string // allowed client keys; empty means open access
-	Gemini        gemini.Config
+	Listen         string   // bind address, e.g. 127.0.0.1:8081 or :8081
+	LogRequests    bool     // log each request at Info level
+	CookieRefresh  int      // minutes between __Secure-1PSIDTS rotations (0 = off)
+	APIKeys        []string // allowed client keys; empty means open access
+	MaxConcurrency int      // max concurrent upstream requests (0 = unlimited)
+	Gemini         gemini.Config
 }
 
 // loadConfig seeds env from a .env file, then reads all settings. The .env path
@@ -39,19 +40,24 @@ func loadConfig(envFile string) *Config {
 	}
 	loadDotenv(envFile)
 
+	maxConc := getEnvInt("GEMINI_MAX_CONCURRENCY", gemini.DefaultMaxConcurrency)
+
 	cfg := &Config{
-		Listen:        normalizeListen(getEnv("GEMINI_LISTEN", defaultListen)),
-		LogRequests:   getEnvBool("GEMINI_LOG_REQUESTS", false),
-		CookieRefresh: getEnvInt("GEMINI_COOKIE_REFRESH_MIN", 9),
-		APIKeys:       splitKeys(getEnv("GEMINI_API_KEYS", "")),
+		Listen:         normalizeListen(getEnv("GEMINI_LISTEN", defaultListen)),
+		LogRequests:    getEnvBool("GEMINI_LOG_REQUESTS", false),
+		CookieRefresh:  getEnvInt("GEMINI_COOKIE_REFRESH_MIN", 9),
+		APIKeys:        splitKeys(getEnv("GEMINI_API_KEYS", "")),
+		MaxConcurrency: maxConc,
 		Gemini: gemini.Config{
 			RetryAttempts:  getEnvInt("GEMINI_RETRY_ATTEMPTS", 3),
 			RetryDelaySec:  getEnvInt("GEMINI_RETRY_DELAY_SEC", 2),
 			RequestTimeout: getEnvInt("GEMINI_REQUEST_TIMEOUT_SEC", 180),
 			AuthUser:       getEnv("GEMINI_AUTH_USER", ""),
-			DefaultModel:   getEnv("GEMINI_DEFAULT_MODEL", "gemini-3.5-flash"),
+			DefaultModel:   getEnv("GEMINI_DEFAULT_MODEL", gemini.DefaultModel),
 			Cookie:         getEnv("GEMINI_COOKIE", ""),
 			CookieFile:     getEnv("GEMINI_COOKIE_FILE", ""),
+			Cookies:        splitLines(getEnv("GEMINI_COOKIES", "")),
+			MaxConcurrency: maxConc,
 			Proxy:          getEnv("GEMINI_PROXY", ""),
 		},
 	}
@@ -165,6 +171,22 @@ func splitKeys(s string) []string {
 	for _, p := range parts {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitLines splits on newlines into trimmed, non-empty, non-comment lines.
+func splitLines(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
 		}
 	}
 	return out

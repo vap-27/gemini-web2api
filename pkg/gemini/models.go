@@ -68,8 +68,9 @@ func (m *AvailableModel) headers(reqUUID string) map[string]string {
 
 // ─── Registry accessors (on Client) ──────────────────────────────────────────
 
-// ResolveModel looks up a model by name, substituting the configured default for
-// an empty name.
+// ResolveModel looks up a model by name, with support for aliases (e.g. gpt-4o,
+// claude-3-5-sonnet, gemini-pro, gemini-flash, thinking), normalizations (stripping
+// "models/" or "-latest"), and substituting the configured default for an empty name.
 func (c *Client) ResolveModel(name string) (*AvailableModel, error) {
 	if name == "" {
 		if m := c.defaultModel(); m != nil {
@@ -78,12 +79,136 @@ func (c *Client) ResolveModel(name string) (*AvailableModel, error) {
 		return nil, errors.New("no models available")
 	}
 	c.modelMu.Lock()
-	m, ok := c.models[name]
-	c.modelMu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown model: %q", name)
+	defer c.modelMu.Unlock()
+
+	// 1. Direct exact match
+	if m, ok := c.models[name]; ok {
+		return m, nil
 	}
-	return m, nil
+
+	// 2. Normalized match (strip "models/", lowercase, trim)
+	clean := strings.ToLower(strings.TrimSpace(name))
+	clean = strings.TrimPrefix(clean, "models/")
+	if m, ok := c.models[clean]; ok {
+		return m, nil
+	}
+
+	// 3. Strip common tags like -latest, :latest, -preview, -exp, -001, -002
+	base := stripModelSuffix(clean)
+	if m, ok := c.models[base]; ok {
+		return m, nil
+	}
+
+	// 4. Alias lookup (maps standard OpenAI/Anthropic/Gemini names onto catalog)
+	if aliased := c.resolveAliasLocked(clean); aliased != nil {
+		return aliased, nil
+	}
+
+	// 5. Substring / prefix match among registered models
+	for _, mName := range c.modelOrder {
+		if strings.Contains(mName, clean) || strings.Contains(clean, mName) {
+			return c.models[mName], nil
+		}
+	}
+
+	return nil, fmt.Errorf("unknown model: %q", name)
+}
+
+// stripModelSuffix removes common version and tag suffixes from a model slug.
+func stripModelSuffix(s string) string {
+	for _, suf := range []string{
+		"-latest", ":latest", "-preview", "-exp",
+		"-001", "-002", "-02-05", "-20241022", "-20240229", "-20240307",
+	} {
+		s = strings.TrimSuffix(s, suf)
+	}
+	return s
+}
+
+// resolveAliasLocked maps common model aliases onto an appropriate registered model.
+// Caller must hold c.modelMu.
+func (c *Client) resolveAliasLocked(alias string) *AvailableModel {
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	alias = strings.TrimPrefix(alias, "models/")
+
+	switch alias {
+	case "gemini-pro", "pro", "gemini-2.5-pro", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-3.1-pro", "gemini-3.5-pro",
+		"gemini-argon", "argon", "gemini-4-argon",
+		"gpt-4", "gpt-4o", "gpt-4-turbo", "o1", "o1-mini", "o1-preview", "o3-mini",
+		"claude-3-7-sonnet", "claude-3-5-sonnet", "claude-3-opus", "claude-3-sonnet":
+		if strings.Contains(c.cfg.DefaultModel, "argon") && c.models[c.cfg.DefaultModel] != nil {
+			return c.models[c.cfg.DefaultModel]
+		}
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "argon") {
+				return c.models[name]
+			}
+		}
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "pro") {
+				return c.models[name]
+			}
+		}
+		if m, ok := c.models[c.cfg.DefaultModel]; ok {
+			return m
+		}
+		if len(c.modelOrder) > 0 {
+			return c.models[c.modelOrder[0]]
+		}
+
+	case "gemini-flash", "flash", "fast", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.5-flash", "gemini-3.1-flash",
+		"gpt-4o-mini", "gpt-3.5-turbo", "claude-3-5-haiku", "claude-3-haiku":
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "flash") || strings.Contains(name, "fast") {
+				return c.models[name]
+			}
+		}
+		if m, ok := c.models[c.cfg.DefaultModel]; ok {
+			return m
+		}
+		if len(c.modelOrder) > 0 {
+			return c.models[c.modelOrder[0]]
+		}
+
+	case "thinking", "gemini-thinking", "gemini-2.5-flash-thinking", "gemini-2.0-flash-thinking", "gemini-2.0-flash-thinking-exp":
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "thinking") {
+				return c.models[name]
+			}
+		}
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "pro") {
+				return c.models[name]
+			}
+		}
+		if m, ok := c.models[c.cfg.DefaultModel]; ok {
+			return m
+		}
+		if len(c.modelOrder) > 0 {
+			return c.models[c.modelOrder[0]]
+		}
+
+	case "lite", "gemini-lite", "gemini-2.0-flash-lite", "gemini-3.1-flash-lite", "gemini-1.5-flash-8b":
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "lite") || strings.Contains(name, "8b") {
+				return c.models[name]
+			}
+		}
+		for _, name := range c.modelOrder {
+			if strings.Contains(name, "flash") {
+				return c.models[name]
+			}
+		}
+
+	case "auto", "default":
+		if m, ok := c.models[c.cfg.DefaultModel]; ok {
+			return m
+		}
+		if len(c.modelOrder) > 0 {
+			return c.models[c.modelOrder[0]]
+		}
+	}
+	return nil
 }
 
 // ResolveModelOrDefault resolves a model name, falling back to the configured
@@ -267,7 +392,7 @@ func (c *Client) dynamicModels(ctx context.Context) ([]*AvailableModel, error) {
 // honestly just the configured default, and requesting any other name returns 400.
 func fallbackModels(defaultModel string) []*AvailableModel {
 	if defaultModel == "" {
-		defaultModel = "gemini-3.5-flash"
+		defaultModel = DefaultModel
 	}
 	return []*AvailableModel{{
 		Name:          defaultModel,

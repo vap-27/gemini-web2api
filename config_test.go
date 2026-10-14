@@ -184,3 +184,22 @@ func TestNormalizeListen(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitLines(t *testing.T) {
+	input := "cookie1=val1;\n# comment line\n\ncookie2=val2;\n"
+	got := splitLines(input)
+	if len(got) != 2 || got[0] != "cookie1=val1;" || got[1] != "cookie2=val2;" {
+		t.Errorf("splitLines = %v, want [cookie1=val1;, cookie2=val2;]", got)
+	}
+	if splitLines("   \n\n  ") != nil {
+		t.Errorf("empty splitLines should return nil")
+	}
+}
+
+func TestConfigMaxConcurrency(t *testing.T) {
+	t.Setenv("GEMINI_MAX_CONCURRENCY", "40")
+	cfg := loadConfig(filepath.Join(t.TempDir(), "empty.env"))
+	if cfg.MaxConcurrency != 40 || cfg.Gemini.MaxConcurrency != 40 {
+		t.Errorf("MaxConcurrency = %d, want 40", cfg.MaxConcurrency)
+	}
+}

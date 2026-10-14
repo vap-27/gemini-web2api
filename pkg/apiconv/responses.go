@@ -3,6 +3,7 @@ package apiconv
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"time"
 
 	"github.com/n0madic/go-gemini-web2api/pkg/gemini"
@@ -17,13 +18,40 @@ const modelCreated = 1700000000
 
 // ─── OpenAI Chat Completions builders ────────────────────────────────────────
 
+// splitThinking separates <thought>...</thought> blocks into reasoning and final text.
+func splitThinking(text string) (reasoning string, content string) {
+	startTag := "<thought>"
+	endTag := "</thought>"
+	start := strings.Index(text, startTag)
+	if start != -1 {
+		end := strings.Index(text[start:], endTag)
+		if end != -1 {
+			end += start
+			thought := strings.TrimSpace(text[start+len(startTag) : end])
+			remaining := strings.TrimSpace(text[:start] + text[end+len(endTag):])
+			return thought, remaining
+		}
+	}
+	return "", text
+}
+
 // ChatCompletion builds a non-streaming /v1/chat/completions response.
 func ChatCompletion(id, model, prompt, text string, toolCalls []ToolCall) any {
 	finish := "stop"
 	if len(toolCalls) > 0 {
 		finish = "tool_calls"
 	}
-	msg := outMessage{Role: "assistant", Content: contentPtr(text), ToolCalls: toolCalls}
+	thought, cleanText := splitThinking(text)
+	var thoughtPtr *string
+	if thought != "" {
+		thoughtPtr = &thought
+	}
+	msg := outMessage{
+		Role:             "assistant",
+		Content:          contentPtr(cleanText),
+		ReasoningContent: thoughtPtr,
+		ToolCalls:        toolCalls,
+	}
 	return chatCompletion{
 		ID: id, Object: "chat.completion", Created: now(), Model: model,
 		Choices: []chatChoice{{Index: 0, Message: &msg, FinishReason: &finish}},
@@ -37,6 +65,15 @@ func ChatChunk(id string, created int64, model, content string) any {
 	return chatChunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Content: &c}, FinishReason: nil}},
+	}
+}
+
+// ChatChunkReasoning builds a streaming chunk carrying a reasoning_content delta.
+func ChatChunkReasoning(id string, created int64, model, reasoning string) any {
+	r := reasoning
+	return chatChunk{
+		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
+		Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{ReasoningContent: &r}, FinishReason: nil}},
 	}
 }
 
@@ -78,6 +115,17 @@ func OpenAIModelList(models []*gemini.AvailableModel) any {
 		})
 	}
 	return modelsListResponse{Object: "list", Data: data}
+}
+
+// OpenAIModel builds the OpenAI GET /v1/models/{model} payload.
+func OpenAIModel(m *gemini.AvailableModel) any {
+	return modelObject{
+		ID:          m.Name,
+		Object:      "model",
+		Created:     modelCreated,
+		OwnedBy:     "google",
+		Description: m.Description,
+	}
 }
 
 // ─── OpenAI Responses API builders ───────────────────────────────────────────
@@ -176,9 +224,10 @@ type chatChoice struct {
 }
 
 type outMessage struct {
-	Role      string     `json:"role"`
-	Content   *string    `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role"`
+	Content          *string    `json:"content"`
+	ReasoningContent *string    `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatChunk struct {
@@ -198,9 +247,10 @@ type chunkChoice struct {
 // chunkDelta is a streaming delta. All fields use omitempty so a content delta
 // is {"content":"..."} and the terminating delta is {}.
 type chunkDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   *string    `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          *string    `json:"content,omitempty"`
+	ReasoningContent *string    `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type usage struct {

@@ -9,7 +9,10 @@ const DefaultBuildLabel = "boq_assistant-bard-web-server_20260529.02_p0"
 // working client.
 const (
 	// DefaultModel is used when Config.DefaultModel is empty.
-	DefaultModel = "gemini-3.5-flash"
+	DefaultModel = "gemini-2.5-flash"
+	// DefaultMaxConcurrency is the max concurrent upstream requests when
+	// Config.MaxConcurrency is zero.
+	DefaultMaxConcurrency = 50
 	// DefaultRequestTimeout is the per-request HTTP timeout (seconds) used when
 	// Config.RequestTimeout is zero.
 	DefaultRequestTimeout = 180
@@ -27,16 +30,18 @@ const (
 // variables. All fields are plain values with no smart defaults except GeminiBL,
 // which falls back to DefaultBuildLabel inside New when left empty.
 type Config struct {
-	Proxy          string // optional HTTP/HTTPS proxy URL
-	RequestTimeout int    // per-request timeout, seconds
-	GeminiBL       string // build label (bl) sent to the backend
-	GeminiBLAuto   bool   // auto-resolve the build label from the Gemini page (defaults on when GeminiBL is unset)
-	AuthUser       string // /u/N account index for non-default Google accounts
-	DefaultModel   string // model used when a request names none
-	Cookie         string // inline cookie string
-	CookieFile     string // path to a cookie file (raw "k=v; …" string)
-	RetryAttempts  int    // blocking-generate retry attempts
-	RetryDelaySec  int    // delay between retries, seconds
+	Proxy          string   // optional HTTP/HTTPS proxy URL
+	RequestTimeout int      // per-request timeout, seconds
+	GeminiBL       string   // build label (bl) sent to the backend
+	GeminiBLAuto   bool     // auto-resolve the build label from the Gemini page (defaults on when GeminiBL is unset)
+	AuthUser       string   // /u/N account index for non-default Google accounts
+	DefaultModel   string   // model used when a request names none
+	Cookie         string   // inline cookie string
+	CookieFile     string   // path to a cookie file (raw "k=v; …" string, or multi-line)
+	Cookies        []string // multiple cookies for account pooling and load distribution
+	MaxConcurrency int      // max concurrent upstream requests (default 20, < 0 is unlimited)
+	RetryAttempts  int      // blocking-generate retry attempts
+	RetryDelaySec  int      // delay between retries, seconds
 }
 
 // applyDefaults fills any field left at its zero value with the corresponding
@@ -62,6 +67,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RetryDelaySec < 1 {
 		c.RetryDelaySec = DefaultRetryDelaySec
+	}
+	if c.MaxConcurrency == 0 {
+		c.MaxConcurrency = DefaultMaxConcurrency
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = DefaultModel

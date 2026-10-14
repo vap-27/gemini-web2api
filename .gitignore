@@ -1,6 +1,7 @@
 # Build output
 /go-gemini-web2api
 *.exe
+*.exe~
 
 # Local config
 .env

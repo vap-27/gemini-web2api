@@ -42,29 +42,73 @@ func imageRefsField(images []uploadedImage) any {
 }
 
 // uploadImages resolves and uploads each input image, returning the successful
-// uploads. A failed image (bad data, fetch error, upload error) is logged and
-// skipped so the request still proceeds with the remaining images and text.
+// uploads. When multiple images are provided, it downloads and uploads them
+// concurrently for maximum throughput. A failed image (bad data, fetch error,
+// upload error) is logged and skipped so the request still proceeds.
 func (c *Client) uploadImages(ctx context.Context, imgs []InputImage) []uploadedImage {
 	if len(imgs) == 0 {
 		return nil
 	}
-	out := make([]uploadedImage, 0, len(imgs))
-	for i := range imgs {
-		data, err := c.imageBytes(ctx, imgs[i])
+	if len(imgs) == 1 {
+		data, err := c.imageBytes(ctx, imgs[0])
 		if err != nil {
-			c.log.Warn("skipping image: cannot obtain bytes", "index", i, "err", err)
-			continue
+			c.log.Warn("skipping image: cannot obtain bytes", "index", 0, "err", err)
+			return nil
 		}
-		name := imgs[i].Filename
+		name := imgs[0].Filename
 		if name == "" {
 			name = "image.png"
 		}
 		ref, err := c.uploadImage(ctx, data, name)
 		if err != nil {
-			c.log.Warn("skipping image: upload failed", "index", i, "err", err)
-			continue
+			c.log.Warn("skipping image: upload failed", "index", 0, "err", err)
+			return nil
 		}
-		out = append(out, uploadedImage{ref: ref, filename: name})
+		return []uploadedImage{{ref: ref, filename: name}}
+	}
+
+	type result struct {
+		index int
+		img   uploadedImage
+		err   error
+	}
+
+	ch := make(chan result, len(imgs))
+	for i := range imgs {
+		go func(idx int, im InputImage) {
+			data, err := c.imageBytes(ctx, im)
+			if err != nil {
+				ch <- result{index: idx, err: fmt.Errorf("cannot obtain bytes: %w", err)}
+				return
+			}
+			name := im.Filename
+			if name == "" {
+				name = fmt.Sprintf("image_%d.png", idx+1)
+			}
+			ref, err := c.uploadImage(ctx, data, name)
+			if err != nil {
+				ch <- result{index: idx, err: fmt.Errorf("upload failed: %w", err)}
+				return
+			}
+			ch <- result{index: idx, img: uploadedImage{ref: ref, filename: name}}
+		}(i, imgs[i])
+	}
+
+	ordered := make([]*uploadedImage, len(imgs))
+	for i := 0; i < len(imgs); i++ {
+		res := <-ch
+		if res.err != nil {
+			c.log.Warn("skipping image", "index", res.index, "err", res.err)
+		} else {
+			ordered[res.index] = &res.img
+		}
+	}
+
+	out := make([]uploadedImage, 0, len(imgs))
+	for _, up := range ordered {
+		if up != nil {
+			out = append(out, *up)
+		}
 	}
 	return out
 }

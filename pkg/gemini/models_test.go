@@ -193,10 +193,10 @@ func TestFallbackModels(t *testing.T) {
 	if len(custom) != 1 || custom[0].Name != "gemini-custom" {
 		t.Errorf("custom default = %+v, want a single gemini-custom entry", custom)
 	}
-	// An empty default falls back to gemini-3.5-flash.
+	// An empty default falls back to DefaultModel.
 	empty := fallbackModels("")
-	if len(empty) != 1 || empty[0].Name != "gemini-3.5-flash" {
-		t.Errorf("empty default = %+v, want a single gemini-3.5-flash entry", empty)
+	if len(empty) != 1 || empty[0].Name != DefaultModel {
+		t.Errorf("empty default = %+v, want a single %s entry", empty, DefaultModel)
 	}
 }
 
@@ -216,6 +216,51 @@ func TestResolveModelRegistry(t *testing.T) {
 	// Foreign id falls back to the default.
 	if m := c.ResolveModelOrDefault("claude-3"); m.Name != "gemini-3.5-flash" {
 		t.Errorf("orDefault = %q, want gemini-3.5-flash", m.Name)
+	}
+}
+
+func TestModelAliasesAndNormalization(t *testing.T) {
+	c, _ := New(testConfig(), testLogger())
+	seedModels(c) // has: gemini-3.5-flash, gemini-3.1-pro, gemini-3.1-flash-lite
+
+	cases := []struct {
+		input    string
+		wantName string
+	}{
+		// Path prefix stripping
+		{"models/gemini-3.1-pro", "gemini-3.1-pro"},
+		{"MODELS/gemini-3.5-flash", "gemini-3.5-flash"},
+		// Suffix stripping
+		{"gemini-3.1-pro-latest", "gemini-3.1-pro"},
+		// Standard Pro aliases
+		{"gpt-4o", "gemini-3.1-pro"},
+		{"gpt-4", "gemini-3.1-pro"},
+		{"claude-3-5-sonnet", "gemini-3.1-pro"},
+		{"pro", "gemini-3.1-pro"},
+		{"gemini-pro", "gemini-3.1-pro"},
+		// Standard Flash aliases
+		{"gpt-4o-mini", "gemini-3.5-flash"},
+		{"gpt-3.5-turbo", "gemini-3.5-flash"},
+		{"claude-3-5-haiku", "gemini-3.5-flash"},
+		{"flash", "gemini-3.5-flash"},
+		{"fast", "gemini-3.5-flash"},
+		// Thinking aliases
+		{"thinking", "gemini-3.1-pro"}, // falls back to pro when thinking not present
+		// Default / auto
+		{"auto", "gemini-3.5-flash"},
+		{"default", "gemini-3.5-flash"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			m, err := c.ResolveModel(tc.input)
+			if err != nil {
+				t.Fatalf("ResolveModel(%q) unexpected error: %v", tc.input, err)
+			}
+			if m.Name != tc.wantName {
+				t.Errorf("ResolveModel(%q) = %q, want %q", tc.input, m.Name, tc.wantName)
+			}
+		})
 	}
 }
 

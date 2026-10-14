@@ -398,6 +398,16 @@ func GoogleModelList(models []*gemini.AvailableModel) any {
 	return googleModelsResponse{Models: out}
 }
 
+// GoogleModel builds the Google GET /v1beta/models/{model} payload.
+func GoogleModel(m *gemini.AvailableModel) any {
+	return googleModelObject{
+		Name:                       "models/" + m.Name,
+		DisplayName:                m.Name,
+		Description:                m.Description,
+		SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
+	}
+}
+
 // ─── Output types ────────────────────────────────────────────────────────────
 
 // generateContentResponse is the Google native generateContent reply (also used

@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -64,6 +66,19 @@ var snlm0eRe = regexp.MustCompile(`"SNlM0e":"([^"]+)"`)
 // buildLabelTTL is how long an auto-resolved build label is reused before refresh.
 const buildLabelTTL = 30 * time.Minute
 
+// Session represents an individual account or anonymous session with its own
+// cookie, SAPISID, and XSRF at-token.
+type Session struct {
+	mu         sync.Mutex
+	ID         int
+	CookieStr  string
+	SAPISID    string
+	AtToken    string
+	AuthStatus string
+	FileBacked bool
+	FilePath   string
+}
+
 // Client talks to the Gemini web backend. It is safe for concurrent use.
 type Client struct {
 	cfg  Config
@@ -76,6 +91,14 @@ type Client struct {
 	cookieSAPI   string
 	cookieMtime  time.Time
 	cookieLoaded bool
+
+	// Concurrency limiter channel semaphore
+	sem chan struct{}
+
+	// Multi-session pool for round-robin concurrent load balancing
+	sessMu   sync.Mutex
+	sessions []*Session
+	sessIdx  uint64
 
 	// Build label, optionally auto-resolved from the Gemini page.
 	blMu         sync.Mutex
@@ -99,27 +122,49 @@ type Client struct {
 	modelsRefreshing bool
 }
 
-// New builds a Client with an HTTP client honouring the configured timeout and
-// proxy. Any Config field left at its zero value is filled with the matching
-// Default* constant (see Config.applyDefaults), so gemini.Config{} — optionally
-// with just a cookie — yields a working client. A nil logger defaults to
-// slog.Default().
+// New builds a Client with an HTTP client honouring the configured timeout,
+// proxy, connection pooling, and concurrency limit. Any Config field left at
+// its zero value is filled with the matching Default* constant (see
+// Config.applyDefaults), so gemini.Config{} — optionally with just a cookie —
+// yields a working client. A nil logger defaults to slog.Default().
 func New(cfg Config, logger *slog.Logger) (*Client, error) {
 	cfg.applyDefaults()
 	if logger == nil {
 		logger = slog.Default()
 	}
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-	}
+
+	proxyFunc := http.ProxyFromEnvironment
 	if cfg.Proxy != "" {
 		pu, err := url.Parse(cfg.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("invalid proxy URL: %w", err)
 		}
-		transport.Proxy = http.ProxyURL(pu)
+		proxyFunc = http.ProxyURL(pu)
 	}
-	return &Client{
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	transport := &http.Transport{
+		Proxy:                 proxyFunc,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   200, // high-concurrency connection pool
+		MaxConnsPerHost:       500,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	var sem chan struct{}
+	if cfg.MaxConcurrency > 0 {
+		sem = make(chan struct{}, cfg.MaxConcurrency)
+	}
+
+	c := &Client{
 		cfg: cfg,
 		http: &http.Client{
 			Timeout:   time.Duration(cfg.RequestTimeout) * time.Second,
@@ -128,7 +173,10 @@ func New(cfg Config, logger *slog.Logger) (*Client, error) {
 		log:    logger,
 		bl:     cfg.GeminiBL,
 		blAuto: cfg.GeminiBLAuto,
-	}, nil
+		sem:    sem,
+	}
+	c.initSessions()
+	return c, nil
 }
 
 // GenParams carries everything needed for a single generation request.
@@ -154,8 +202,136 @@ type InputImage struct {
 // headers (see AvailableModel.headers), not the payload; inner[17] is a constant.
 //
 // It also returns the per-request UUID (inner[59]); the caller must echo it in the
-// x-goog-ext-525005358-jspb selection header so the two stay in sync.
+// initSessions populates the session pool from Config.Cookies, Config.CookieFile,
+// Config.Cookie, or an anonymous fallback session.
+func (c *Client) initSessions() {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+
+	var sessions []*Session
+
+	// 1. Explicit multi-cookie list
+	if len(c.cfg.Cookies) > 0 {
+		for i, ck := range c.cfg.Cookies {
+			ck = strings.TrimSpace(ck)
+			if ck == "" {
+				continue
+			}
+			sapi := cookieValue(ck, cookieSAPISID)
+			sessions = append(sessions, &Session{
+				ID:        i,
+				CookieStr: ck,
+				SAPISID:   sapi,
+			})
+		}
+	}
+
+	// 2. Cookie file (supports multi-line cookies for account pooling)
+	if len(sessions) == 0 && c.cfg.CookieFile != "" {
+		if data, err := os.ReadFile(c.cfg.CookieFile); err == nil {
+			lines := strings.Split(string(data), "\n")
+			idx := 0
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				sapi := cookieValue(line, cookieSAPISID)
+				sessions = append(sessions, &Session{
+					ID:         idx,
+					CookieStr:  line,
+					SAPISID:    sapi,
+					FileBacked: true,
+					FilePath:   c.cfg.CookieFile,
+				})
+				idx++
+			}
+		}
+	}
+
+	// 3. Single inline cookie
+	if len(sessions) == 0 && c.cfg.Cookie != "" {
+		sapi := cookieValue(c.cfg.Cookie, cookieSAPISID)
+		sessions = append(sessions, &Session{
+			ID:        0,
+			CookieStr: c.cfg.Cookie,
+			SAPISID:   sapi,
+		})
+	}
+
+	// 4. Anonymous fallback
+	if len(sessions) == 0 {
+		sessions = append(sessions, &Session{
+			ID:         0,
+			AuthStatus: "anonymous",
+		})
+	}
+
+	c.sessions = sessions
+}
+
+// nextSession returns the next session from the pool using round-robin.
+func (c *Client) nextSession() *Session {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	if len(c.sessions) == 0 {
+		return &Session{AuthStatus: "anonymous"}
+	}
+	idx := atomic.AddUint64(&c.sessIdx, 1) % uint64(len(c.sessions))
+	return c.sessions[idx]
+}
+
+// primarySession returns the first session (or default anonymous session).
+func (c *Client) primarySession() *Session {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	if len(c.sessions) == 0 {
+		return &Session{AuthStatus: "anonymous"}
+	}
+	return c.sessions[0]
+}
+
+// SessionCount returns the number of active sessions in the pool.
+func (c *Client) SessionCount() int {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return len(c.sessions)
+}
+
+// acquireConcurrency claims a slot under the concurrency limiter, or blocks
+// until one is available or ctx is cancelled.
+func (c *Client) acquireConcurrency(ctx context.Context) (func(), error) {
+	if c.sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.sem <- struct{}{}:
+		return func() { <-c.sem }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("concurrency limit (%d) reached: %w", c.cfg.MaxConcurrency, ctx.Err())
+	}
+}
+
+// ActiveRequests returns the number of currently active in-flight upstream requests.
+func (c *Client) ActiveRequests() int {
+	if c.sem == nil {
+		return 0
+	}
+	return len(c.sem)
+}
+
+// MaxConcurrency returns the configured max concurrency (or 0 if unlimited).
+func (c *Client) MaxConcurrency() int {
+	return c.cfg.MaxConcurrency
+}
+
+// buildBody constructs the urlencoded request body for StreamGenerate.
 func (c *Client) buildBody(p GenParams, images []uploadedImage) (body, reqUUID string, err error) {
+	return c.buildBodyWithSession(p, images, c.primarySession())
+}
+
+// buildBodyWithSession constructs the urlencoded request body using the given session's at token.
+func (c *Client) buildBodyWithSession(p GenParams, images []uploadedImage, sess *Session) (body, reqUUID string, err error) {
 	reqUUID = strings.ToUpper(uuid4())
 	inner := make([]any, 69)
 	inner[0] = []any{p.Prompt, 0, nil, imageRefsField(images), nil, nil, 0}
@@ -186,7 +362,16 @@ func (c *Client) buildBody(p GenParams, images []uploadedImage) (body, reqUUID s
 
 	vals := url.Values{}
 	vals.Set("f.req", string(outerJSON))
-	if at := c.currentAt(); at != "" {
+	at := ""
+	if sess != nil {
+		sess.mu.Lock()
+		at = sess.AtToken
+		sess.mu.Unlock()
+	}
+	if at == "" {
+		at = c.currentAt()
+	}
+	if at != "" {
 		vals.Set("at", at)
 	}
 	return vals.Encode(), reqUUID, nil
@@ -293,44 +478,95 @@ func (c *Client) accountPrefix() string {
 	return "/u/" + c.cfg.AuthUser
 }
 
-// CheckAuth reports whether the configured cookie establishes a signed-in Gemini
-// session, detected via the SNlM0e token (issued only to authenticated sessions).
-// It returns a short human-readable status and logs a warning when a cookie is
-// present but does not authenticate. The token value itself is never logged.
+// CheckAuth reports whether the configured cookies establish signed-in Gemini
+// sessions, detected via the SNlM0e token (issued only to authenticated sessions).
+// It returns a human-readable status indicating how many sessions authenticated.
 func (c *Client) CheckAuth(ctx context.Context) string {
+	c.sessMu.Lock()
+	sessions := append([]*Session(nil), c.sessions...)
+	c.sessMu.Unlock()
+
 	cookie, _ := c.loadCookie()
-	if cookie == "" {
+	if len(sessions) == 0 || (len(sessions) == 1 && cookie == "") {
 		return "anonymous"
 	}
-	html, err := c.fetchAppPage(ctx)
-	if err != nil {
-		c.log.Warn("cookie auth check failed", "err", err)
-		return "unknown (fetch failed)"
+
+	authenticatedCount := 0
+	for _, sess := range sessions {
+		sess.mu.Lock()
+		cStr := sess.CookieStr
+		sess.mu.Unlock()
+		if cStr == "" {
+			cStr = cookie
+		}
+		if cStr == "" {
+			continue
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, geminiBaseURL+c.accountPrefix()+"/app", nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Cookie", cStr)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			continue
+		}
+		html, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+
+		if m := snlm0eRe.FindSubmatch(html); m != nil {
+			tok := string(m[1])
+			sess.mu.Lock()
+			sess.AtToken = tok
+			sess.AuthStatus = "authenticated"
+			sess.mu.Unlock()
+			authenticatedCount++
+		} else {
+			sess.mu.Lock()
+			sess.AuthStatus = "not authenticated"
+			sess.mu.Unlock()
+		}
 	}
-	if m := snlm0eRe.FindSubmatch(html); m != nil {
-		c.setAt(string(m[1])) // authenticated requests must echo this XSRF token back
-		c.log.Info("gemini cookie authenticated")
+
+	if authenticatedCount > 0 {
+		c.setAt(sessions[0].AtToken)
+		c.log.Info("gemini cookie authenticated", "authenticated_sessions", authenticatedCount, "total_sessions", len(sessions))
+		if len(sessions) > 1 {
+			return fmt.Sprintf("authenticated (%d/%d sessions active)", authenticatedCount, len(sessions))
+		}
 		return "authenticated"
 	}
+
 	c.log.Warn("gemini cookie is NOT authenticating — requests run anonymously",
 		"hint", "the session needs __Secure-1PSIDTS (it expires; re-export the cookie)")
 	return "NOT authenticated"
 }
 
 // currentAt returns the XSRF "at" token to send with StreamGenerate: the SNlM0e
-// value scraped from the signed-in page (refreshed after each cookie rotation, as
-// it rotates with the session). Empty for anonymous sessions, which need no token.
+// value scraped from the signed-in page.
 func (c *Client) currentAt() string {
+	sess := c.primarySession()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.AtToken != "" {
+		return sess.AtToken
+	}
 	c.atMu.Lock()
 	defer c.atMu.Unlock()
 	return c.atToken
 }
 
-// setAt caches the scraped SNlM0e XSRF token.
+// setAt caches the scraped SNlM0e XSRF token across the client and primary session.
 func (c *Client) setAt(token string) {
 	c.atMu.Lock()
 	c.atToken = token
 	c.atMu.Unlock()
+	sess := c.primarySession()
+	sess.mu.Lock()
+	sess.AtToken = token
+	sess.mu.Unlock()
 }
 
 // ImagesSupported reports whether image attachments can be used. They require an
@@ -344,23 +580,50 @@ func (c *Client) ImagesSupported() bool {
 // caches it. Called after a cookie rotation so the token stays in sync with the
 // refreshed session.
 func (c *Client) refreshAtToken(ctx context.Context) {
-	if cookie, _ := c.loadCookie(); cookie == "" {
-		return
+	c.sessMu.Lock()
+	sessions := append([]*Session(nil), c.sessions...)
+	c.sessMu.Unlock()
+
+	for _, sess := range sessions {
+		sess.mu.Lock()
+		ck := sess.CookieStr
+		sess.mu.Unlock()
+		if ck == "" {
+			ck, _ = c.loadCookie()
+		}
+		if ck == "" {
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, geminiBaseURL+c.accountPrefix()+"/app", nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Cookie", ck)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			continue
+		}
+		html, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if m := snlm0eRe.FindSubmatch(html); m != nil {
+			sess.mu.Lock()
+			sess.AtToken = string(m[1])
+			sess.mu.Unlock()
+		}
 	}
-	html, err := c.fetchAppPage(ctx)
-	if err != nil {
-		return
-	}
-	if m := snlm0eRe.FindSubmatch(html); m != nil {
-		c.setAt(string(m[1]))
+	if len(sessions) > 0 {
+		c.setAt(sessions[0].AtToken)
 	}
 }
 
-// newRequest assembles a POST request with all required headers and auth. When a
-// model with a known id is supplied, the four model-selection headers are set
-// (reqUUID must match inner[59] of the body). A nil model or an empty model id
-// (the fallback/anonymous case) omits them so the request uses the account default.
+// newRequest assembles a POST request with all required headers and auth.
 func (c *Client) newRequest(ctx context.Context, body string, model *AvailableModel, reqUUID string) (*http.Request, error) {
+	return c.newRequestWithSession(ctx, body, model, reqUUID, c.primarySession())
+}
+
+// newRequestWithSession assembles a POST request using the designated session credentials.
+func (c *Client) newRequestWithSession(ctx context.Context, body string, model *AvailableModel, reqUUID string, sess *Session) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.streamURL(), strings.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -380,7 +643,16 @@ func (c *Client) newRequest(ctx context.Context, body string, model *AvailableMo
 		}
 	}
 
-	cookie, sapisid := c.loadCookie()
+	var cookie, sapisid string
+	if sess != nil {
+		sess.mu.Lock()
+		cookie = sess.CookieStr
+		sapisid = sess.SAPISID
+		sess.mu.Unlock()
+	}
+	if cookie == "" {
+		cookie, sapisid = c.loadCookie()
+	}
 	if cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
@@ -390,17 +662,25 @@ func (c *Client) newRequest(ctx context.Context, body string, model *AvailableMo
 	return req, nil
 }
 
-// Generate sends a prompt and returns the final response text (blocking, with retry).
+// Generate sends a prompt and returns the final response text (blocking, with retry
+// and concurrency throttling).
 func (c *Client) Generate(ctx context.Context, p GenParams) (string, error) {
+	release, err := c.acquireConcurrency(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	sess := c.nextSession()
 	images := c.uploadImages(ctx, p.Images)
-	body, reqUUID, err := c.buildBody(p, images)
+	body, reqUUID, err := c.buildBodyWithSession(p, images, sess)
 	if err != nil {
 		return "", err
 	}
 
 	var lastErr error
 	for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
-		req, err := c.newRequest(ctx, body, p.Model, reqUUID)
+		req, err := c.newRequestWithSession(ctx, body, p.Model, reqUUID, sess)
 		if err != nil {
 			return "", err
 		}
@@ -412,8 +692,6 @@ func (c *Client) Generate(ctx context.Context, p GenParams) (string, error) {
 			case readErr != nil:
 				err = readErr
 			default:
-				// An empty body is treated as a (retryable) failure rather than a
-				// silent empty answer.
 				if text := extractResponseText(string(raw)); text != "" {
 					return text, nil
 				}
@@ -424,10 +702,15 @@ func (c *Client) Generate(ctx context.Context, p GenParams) (string, error) {
 		if attempt < c.cfg.RetryAttempts-1 {
 			c.log.Warn("retrying gemini request",
 				"attempt", attempt+1, "max", c.cfg.RetryAttempts, "err", err)
+			backoff := time.Duration(c.cfg.RetryDelaySec) * time.Second * (1 << attempt)
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			jitter := time.Duration(time.Now().UnixNano()%300) * time.Millisecond
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
-			case <-time.After(time.Duration(c.cfg.RetryDelaySec) * time.Second):
+			case <-time.After(backoff + jitter):
 			}
 		}
 	}
@@ -439,14 +722,20 @@ func (c *Client) Generate(ctx context.Context, p GenParams) (string, error) {
 }
 
 // GenerateStream sends a prompt and invokes emit for each incremental text delta.
-// Gemini sends cumulative text per chunk, so deltas are computed against prevText.
 func (c *Client) GenerateStream(ctx context.Context, p GenParams, emit func(delta string)) error {
-	images := c.uploadImages(ctx, p.Images)
-	body, reqUUID, err := c.buildBody(p, images)
+	release, err := c.acquireConcurrency(ctx)
 	if err != nil {
 		return err
 	}
-	req, err := c.newRequest(ctx, body, p.Model, reqUUID)
+	defer release()
+
+	sess := c.nextSession()
+	images := c.uploadImages(ctx, p.Images)
+	body, reqUUID, err := c.buildBodyWithSession(p, images, sess)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequestWithSession(ctx, body, p.Model, reqUUID, sess)
 	if err != nil {
 		return err
 	}
@@ -456,11 +745,15 @@ func (c *Client) GenerateStream(ctx context.Context, p GenParams, emit func(delt
 	}
 	defer resp.Body.Close()
 
-	// ReadString grows its buffer as needed, unlike bufio.Scanner which caps at 64KB;
-	// batchexecute lines routinely exceed that.
 	reader := bufio.NewReader(resp.Body)
 	prevText := ""
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		line, readErr := reader.ReadString('\n')
 		if line != "" {
 			if text, ok := latestText(line); ok && len(text) > len(prevText) {
@@ -648,8 +941,16 @@ func (c *Client) loadCookieFile() (cookie, sapisid string) {
 		c.log.Error("cookie load failed", "path", c.cfg.CookieFile, "err", err)
 		return c.cookieStr, c.cookieSAPI
 	}
-	cookie = strings.TrimSpace(string(data))
-	sapisid = cookieValue(cookie, cookieSAPISID)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			cookie = line
+			break
+		}
+	}
+	if cookie != "" {
+		sapisid = cookieValue(cookie, cookieSAPISID)
+	}
 	c.cookieStr, c.cookieSAPI = cookie, sapisid
 	c.cookieMtime, c.cookieLoaded = info.ModTime(), true
 	return cookie, sapisid

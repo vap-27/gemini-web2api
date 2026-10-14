@@ -41,7 +41,9 @@ func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleHealth)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
+	mux.HandleFunc("GET /v1/models/{model}", s.handleModelOpenAI)
 	mux.HandleFunc("GET /v1beta/models", s.handleModelsGoogle)
+	mux.HandleFunc("GET /v1beta/models/{model}", s.handleModelGoogle)
 	mux.Handle("POST /v1/chat/completions", s.withAuth(s.handleChat))
 	mux.Handle("POST /v1/responses", s.withAuth(s.handleResponses))
 	mux.Handle("POST /v1/messages", s.withAuth(s.handleMessages))
@@ -115,9 +117,12 @@ func (s *Server) authorized(r *http.Request) bool {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	sendJSON(w, http.StatusOK, healthResponse{
-		Status:  "ok",
-		Version: version,
-		Models:  s.client.ModelNames(),
+		Status:         "ok",
+		Version:        version,
+		Models:         s.client.ModelNames(),
+		ActiveRequests: s.client.ActiveRequests(),
+		MaxConcurrency: s.client.MaxConcurrency(),
+		Sessions:       s.client.SessionCount(),
 	})
 }
 
@@ -135,8 +140,32 @@ func (s *Server) handleModelsOpenAI(w http.ResponseWriter) {
 	sendJSON(w, http.StatusOK, apiconv.OpenAIModelList(s.client.ListModels()))
 }
 
+func (s *Server) handleModelOpenAI(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("model")
+	m, err := s.client.ResolveModel(name)
+	if err != nil {
+		sendError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", name))
+		return
+	}
+	sendJSON(w, http.StatusOK, apiconv.OpenAIModel(m))
+}
+
 func (s *Server) handleModelsGoogle(w http.ResponseWriter, _ *http.Request) {
 	sendJSON(w, http.StatusOK, apiconv.GoogleModelList(s.client.ListModels()))
+}
+
+func (s *Server) handleModelGoogle(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("model")
+	if strings.Contains(name, ":") {
+		s.handleNotFound(w, r)
+		return
+	}
+	m, err := s.client.ResolveModel(name)
+	if err != nil {
+		sendError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", name))
+		return
+	}
+	sendJSON(w, http.StatusOK, apiconv.GoogleModel(m))
 }
 
 func (s *Server) handleModelsAnthropic(w http.ResponseWriter) {
@@ -214,6 +243,7 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, cid, mod
 	created := time.Now().Unix()
 	var f http.Flusher
 	headerWritten := false
+	inThought := false
 
 	emit := func(text string) {
 		if !headerWritten {
@@ -224,7 +254,26 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, cid, mod
 			f = fl
 			headerWritten = true
 		}
-		writeSSEData(w, f, apiconv.ChatChunk(cid, created, model, text))
+		if strings.Contains(text, "<thought>") {
+			inThought = true
+			text = strings.ReplaceAll(text, "<thought>", "")
+		}
+		if strings.Contains(text, "</thought>") {
+			inThought = false
+			parts := strings.Split(text, "</thought>")
+			if len(parts) > 0 && parts[0] != "" {
+				writeSSEData(w, f, apiconv.ChatChunkReasoning(cid, created, model, parts[0]))
+			}
+			if len(parts) > 1 && parts[1] != "" {
+				writeSSEData(w, f, apiconv.ChatChunk(cid, created, model, parts[1]))
+			}
+			return
+		}
+		if inThought {
+			writeSSEData(w, f, apiconv.ChatChunkReasoning(cid, created, model, text))
+		} else if text != "" {
+			writeSSEData(w, f, apiconv.ChatChunk(cid, created, model, text))
+		}
 	}
 
 	err := s.client.GenerateStream(ctx, p, emit)
@@ -603,9 +652,12 @@ type errorDetail struct {
 
 // healthResponse is returned by GET /.
 type healthResponse struct {
-	Status  string   `json:"status"`
-	Version string   `json:"version"`
-	Models  []string `json:"models"`
+	Status         string   `json:"status"`
+	Version        string   `json:"version"`
+	Models         []string `json:"models"`
+	ActiveRequests int      `json:"active_requests,omitempty"`
+	MaxConcurrency int      `json:"max_concurrency,omitempty"`
+	Sessions       int      `json:"sessions,omitempty"`
 }
 
 // ─── HTTP / SSE helpers ──────────────────────────────────────────────────────

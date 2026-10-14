@@ -158,12 +158,21 @@ func printBanner(cfg *Config, client *gemini.Client, bl, authStatus string) {
 	names := client.ModelNames()
 	models := fmt.Sprintf("%s (%d, %s)", strings.Join(names, ", "), len(names), client.ModelsSourceLabel())
 
+	conc := "unlimited"
+	if cfg.MaxConcurrency > 0 {
+		conc = fmt.Sprintf("%d max concurrent requests", cfg.MaxConcurrency)
+	}
+	if client.SessionCount() > 1 {
+		cookie += fmt.Sprintf(" (%d pooled sessions)", client.SessionCount())
+	}
+
 	fmt.Fprintf(os.Stdout, "gemini-web2api v%s\n", version)
 	fmt.Fprintf(os.Stdout, "  Listening:   %s\n", bindDisplay(cfg.Listen))
 	fmt.Fprintf(os.Stdout, "  Base URL:    %s/v1\n", clientBaseURL(cfg.Listen))
 	fmt.Fprintf(os.Stdout, "  Models:      %s\n", models)
 	fmt.Fprintf(os.Stdout, "  Build:       %s\n", bl)
 	fmt.Fprintf(os.Stdout, "  Cookie:      %s\n", cookie)
+	fmt.Fprintf(os.Stdout, "  Concurrency: %s\n", conc)
 	fmt.Fprintf(os.Stdout, "  Proxy:       %s\n", proxy)
 	fmt.Fprintf(os.Stdout, "  Client auth: %s\n", auth)
 	fmt.Fprintf(os.Stdout, "  Retry:       %dx / %ds\n\n", cfg.Gemini.RetryAttempts, cfg.Gemini.RetryDelaySec)

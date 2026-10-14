@@ -12,10 +12,16 @@ being the source of the header-based model selection and the account-tier capaci
 ## Features
 
 - **Zero cost, zero install** — single static Go binary, stdlib only, no paid subscription
-- **OpenAI compatible** — drop-in `/v1/chat/completions` and `/v1/models`
-- **Anthropic compatible** — `/v1/messages` for Claude Code and Anthropic SDK clients
+- **New Gemini models & intelligent routing** — out of the box support for Gemini 2.5 (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-thinking`), Gemini 2.0, Gemini 1.5, and Gemini 3.x
+- **Intelligent model aliasing** — seamless drop-in routing for `gpt-4o`, `gpt-4o-mini`, `claude-3-5-sonnet`, `claude-3-7-sonnet`, `gemini-pro`, `gemini-flash`, `thinking`, `fast`, and `pro`
+- **High concurrency & connection pooling** — HTTP/2 stream multiplexing, tuned keep-alive pools (`MaxIdleConnsPerHost: 100`), and configurable concurrency throttling (`GEMINI_MAX_CONCURRENCY`)
+- **Multi-cookie account pool** — round-robin across multiple Google accounts (`GEMINI_COOKIES` or multi-line `GEMINI_COOKIE_FILE`) to multiply throughput and quota
+- **Concurrent image uploads** — parallelized Scotty uploads for multi-image vision prompts
+- **Reasoning / thinking tokens** — automatic extraction of `<thought>` blocks into OpenAI `reasoning_content`
+- **OpenAI compatible** — drop-in `/v1/chat/completions`, `/v1/models`, and `/v1/models/{model}`
+- **Anthropic compatible** — `/v1/messages` and token counting for Claude Code and Anthropic SDK clients
 - **Responses API** — `/v1/responses` for OpenAI Codex CLI
-- **Google native API** — `/v1beta/models` for Gemini CLI
+- **Google native API** — `/v1beta/models` and `/v1beta/models/{model}` for Gemini CLI
 - **Streaming** — true SSE token streaming
 - **Tool calling** — OpenAI / Anthropic / Google function calling, with choice constraints (none/auto/required/specific)
 - **Vision / image input** — OpenAI `image_url`, Anthropic `image` blocks, Google `inlineData`, Responses `input_image` (requires an authenticated cookie)
@@ -128,18 +134,18 @@ gemini
 # Non-streaming
 curl http://localhost:8081/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 
 # Streaming
 curl -N http://localhost:8081/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hi"}],"stream":true}'
 
 # With client auth enabled (GEMINI_API_KEYS=sk-secret)
 curl http://localhost:8081/v1/chat/completions \
   -H 'Authorization: Bearer sk-secret' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 ## Configuration (environment variables)
@@ -147,16 +153,18 @@ curl http://localhost:8081/v1/chat/completions \
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_LISTEN` | `127.0.0.1:8081` | Bind address; accepts `host:port`, `:port` (all interfaces), or a bare port. Overridden by `-listen` |
-| `GEMINI_RETRY_ATTEMPTS` | `3` | Upstream retry attempts |
-| `GEMINI_RETRY_DELAY_SEC` | `2` | Delay between retries |
+| `GEMINI_MAX_CONCURRENCY` | `20` | Max concurrent upstream requests allowed simultaneously (semaphore throttling) |
+| `GEMINI_RETRY_ATTEMPTS` | `3` | Upstream retry attempts with exponential jittered backoff |
+| `GEMINI_RETRY_DELAY_SEC` | `2` | Base delay between retries |
 | `GEMINI_REQUEST_TIMEOUT_SEC` | `180` | Per-request timeout |
 | `GEMINI_BL` | `auto` | Gemini web build label; `auto`/empty resolves it from the Gemini page, or pin an explicit value |
-| `GEMINI_DEFAULT_MODEL` | `gemini-3.5-flash` | Model used when none is given |
+| `GEMINI_DEFAULT_MODEL` | `gemini-2.5-flash` | Model used when none is given |
 | `GEMINI_LOG_REQUESTS` | `false` | Log incoming requests at INFO (warnings/errors always shown) |
 | `GEMINI_AUTH_USER` | – | Google account index (`/u/N`) |
-| `GEMINI_COOKIE` | – | Inline cookie string |
-| `GEMINI_COOKIE_FILE` | – | Path to a cookie file (raw `k=v; …` string; overridden by `-cookie-file`) |
-| `GEMINI_COOKIE_REFRESH_MIN` | `9` | Minutes between `__Secure-1PSIDTS` auto-rotations for a file-backed cookie (0 = off) |
+| `GEMINI_COOKIE` | – | Inline single cookie string |
+| `GEMINI_COOKIES` | – | Multiple cookies separated by newlines or `---` for round-robin session load balancing |
+| `GEMINI_COOKIE_FILE` | – | Path to a cookie file (raw `k=v; …` string or multi-line cookies; overridden by `-cookie-file`) |
+| `GEMINI_COOKIE_REFRESH_MIN` | `9` | Minutes between `__Secure-1PSIDTS` auto-rotations for file-backed cookies (0 = off) |
 | `GEMINI_PROXY` | – | HTTP(S) proxy URL |
 | `GEMINI_API_KEYS` | – | Comma-separated accepted client keys (empty = open) |
 | `GEMINI_ENV_FILE` | `.env` | Path to the dotenv file (overridden by `-config`) |
@@ -171,7 +179,7 @@ model lists stay open.
 > Set `GEMINI_API_KEYS` whenever you don't bind to `127.0.0.1` — the proxy prints a
 > loud `OPEN PROXY` warning at startup if you forget.
 
-## Models
+## Models & Routing
 
 The model list is **not hardcoded** — it is read live from your Google account at
 startup (and refreshed after each cookie rotation) via the `otAQ7b` batchexecute
@@ -182,35 +190,43 @@ current list at any time:
 curl http://localhost:8081/v1/models
 ```
 
-Model names come straight from Gemini's versioned label (e.g. `3.1 Flash-Lite` →
-`gemini-3.1-flash-lite`). A typical free account today exposes:
+Model names come straight from Gemini's versioned label (e.g. `2.5 Flash` →
+`gemini-2.5-flash`). Typical modern models exposed by accounts include:
 
 | Model | Description |
 |---|---|
-| `gemini-3.5-flash` | Fast general-purpose model (default) |
-| `gemini-3.1-pro` | Pro model (needs an authenticated cookie) |
-| `gemini-3.1-flash-lite` | Lightweight fast model |
+| `gemini-2.5-flash` | Fast, state-of-the-art multimodal model (default) |
+| `gemini-2.5-pro` | Advanced reasoning and coding model (needs an authenticated cookie) |
+| `gemini-2.5-flash-thinking` | Dedicated reasoning model with chain-of-thought `<thought>` outputs |
+| `gemini-2.0-flash` | Ultra-fast multimodal model |
+| `gemini-1.5-pro` | Long-context Pro model |
 
-The exact names and count depend on your account, so treat the table above as an
-example — trust `/v1/models`. The startup banner shows the resolved list and marks
-its source as `(dynamic)` (from the account) or `(fallback)`.
+### Intelligent Model Aliasing
+
+Third-party AI clients often specify their own model identifiers or API prefixes. The proxy automatically normalizes and routes these:
+- **Prefix / Suffix Stripping**: `models/gemini-2.5-flash` or `gemini-2.5-flash-latest` → `gemini-2.5-flash`
+- **Pro Tier Aliasing**: `gpt-4o`, `gpt-4`, `claude-3-5-sonnet`, `claude-3-7-sonnet`, `gemini-pro`, `pro` → routed to the account's best Pro model
+- **Flash Tier Aliasing**: `gpt-4o-mini`, `gemini-flash`, `fast`, `flash` → routed to the account's Flash model
+- **Thinking Tier Aliasing**: `thinking`, `o1`, `o3-mini`, `claude-3-7-sonnet-thinking` → routed to the thinking model if available
 
 **Fallback list.** When the proxy runs anonymously, or the cookie no longer
 authenticates, or the RPC fails, it cannot read the real catalog and the banner
 shows `(fallback)`. In that mode the backend only serves its default (Flash)
 model — there are no real model ids to select anything else — so the list is
 honestly just the single configured `GEMINI_DEFAULT_MODEL` (default
-`gemini-3.5-flash`). Requesting any other name returns `400` rather than silently
+`gemini-2.5-flash`). Requesting any other name returns `400` rather than silently
 answering with Flash.
 
 ## Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Health / status |
+| `GET` | `/` | Health / status (includes `active_requests`, `max_concurrency`, `sessions`) |
 | `GET` | `/v1/models` | List models (OpenAI or Anthropic format, by `anthropic-version` header) |
+| `GET` | `/v1/models/{model}` | Retrieve single model info (OpenAI format) |
 | `GET` | `/v1beta/models` | List models (Google format) |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions (stream + tools) |
+| `GET` | `/v1beta/models/{model}` | Retrieve single model info (Google format) |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions (stream + tools + reasoning) |
 | `POST` | `/v1/responses` | OpenAI Responses API (Codex CLI) |
 | `POST` | `/v1/messages` | Anthropic Messages API (Claude Code; stream + tools) |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
