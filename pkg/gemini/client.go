@@ -698,6 +698,9 @@ func (c *Client) Generate(ctx context.Context, p GenParams) (string, error) {
 				err = ErrEmptyResponse
 			}
 		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		lastErr = err
 		if attempt < c.cfg.RetryAttempts-1 {
 			c.log.Warn("retrying gemini request",
